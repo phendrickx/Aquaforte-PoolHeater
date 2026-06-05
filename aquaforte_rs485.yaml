@@ -1,5 +1,5 @@
 esphome:
-  name: aquaforte-heatpump
+  name: aquaforte-poolheater
 
 esp32:
   variant: esp32s3
@@ -44,6 +44,19 @@ ota:
 time:
   - platform: homeassistant
     id: esptime
+
+globals:
+  - id: hp_cop_factor
+    type: float
+    initial_value: '300.0'
+  - id: hp_flow_m3h
+    type: float
+    initial_value: '5.9' #Define here your global flow-rate during normal operation, not during backwash/rinse. In m³/h (cubic meters/hour)  
+  - id: hp_cop_filtered
+    type: float
+    initial_value: '0'
+
+
 
 # -----------------------------
 # UART (your RS485)
@@ -200,16 +213,16 @@ number:
 
 # ----------------------------------------------------
 # 3x INPUT REGISTERS (READ ONLY)
-# Split-up in 3 controllers as we can only max read 8 registers at a time in the coiltype, this to avoid CRC-errors
+# Split in 3 controllers so read-ranges don't overlap and avoids timing-issues as the controller can not always follow on load:
 #   0..7
 #   8..14
 #   29..30
-# Dit voorkomt dat ESPHome er één te groot of overlappend bereik van maakt. 
-# ESPHome groepeert ranges automatisch op opeenvolgende adressen. 【1-4c87a2】【2-327c19】
+# This avoids the ESPhome tries to read in one big read for more than 8 registers which is not supported or starts behaving weird. 
+# ESPHome groups ranges automatic for addresses following next to it. 【1-4c87a2】【2-327c19】
 # ----------------------------------------------------
 
 sensor:
-  # ---------- block 3x 0..7 ----------
+  # ---------- blok 3x 0..7 ----------
   - platform: modbus_controller
     modbus_controller_id: aquaforte_3x_0_7
     name: "HP Compressor %"
@@ -293,7 +306,7 @@ sensor:
       return (x - 60) / 2.0;
     unit_of_measurement: "°C"
 
-  # ---------- block 3x 8..14 ----------
+  # ---------- blok 3x 8..14 ----------
   - platform: modbus_controller
     modbus_controller_id: aquaforte_3x_8_14
     name: "HP Gas Return Temp"
@@ -365,7 +378,7 @@ sensor:
     value_type: U_WORD
     unit_of_measurement: "RPM"
 
-  # ---------- block 3x 29..30 ----------
+  # ---------- blok 3x 29..30 ----------
   - platform: modbus_controller
     modbus_controller_id: aquaforte_3x_29_30
     name: "HP Input Power"
@@ -404,24 +417,50 @@ sensor:
       return id(hp_outlet).state - id(hp_inlet).state;
 
   - platform: template
-    name: "HP Heat Output (est)"
+    name: "HP Heat Output"
     id: hp_heat_output
     unit_of_measurement: "W"
     accuracy_decimals: 0
+    state_class: measurement
     lambda: |-
       if (isnan(id(hp_delta_t).state)) return NAN;
-      return id(hp_delta_t).state * id(hp_cop_factor);
+
+      float dt = id(hp_delta_t).state;
+      float flow = id(hp_flow_m3h);
+
+      return 1163.0f * flow * dt;
+
+    #physical constant 1163.0 of water (shortened formula)
 
   - platform: template
     name: "HP COP"
     id: hp_cop
-    unit_of_measurement: ""
     accuracy_decimals: 2
+    state_class: measurement
     lambda: |-
-      float p_in = id(hp_input_power).state;
-      float q_out = id(hp_heat_output).state;
-      if (p_in < 50) return NAN;
-      return q_out / p_in;
+      float p_in = id(hp_input_power).state;   // W
+      float q_out = id(hp_heat_output).state;  // W
+
+      if (p_in < 50 || isnan(q_out)) return NAN;
+
+      float cop_raw = q_out / p_in;
+
+      // sanity guard
+      if (cop_raw < 0.0f || cop_raw > 20.0f) return NAN;
+
+      // exponential smoothing
+      float alpha = 0.2f;
+
+      if (id(hp_cop_filtered) <= 0.0f || isnan(id(hp_cop_filtered))) {
+        id(hp_cop_filtered) = cop_raw;
+      } else {
+        id(hp_cop_filtered) =
+          alpha * cop_raw + (1.0f - alpha) * id(hp_cop_filtered);
+      }
+
+      return roundf(id(hp_cop_filtered) * 100.0f) / 100.0f;
+
+  
   # Needed to have this sensor so it can be added to the energy-consumption tracking
   - platform: total_daily_energy
     name: "HP Daily Energy"
@@ -460,14 +499,10 @@ sensor:
     update_interval: 60s
 
 
-globals:
-  - id: hp_cop_factor
-    type: float
-    initial_value: '300.0'
 
 # ----------------------------------------------------
 # 1x ERROR DECODER
-# 48..55 stays legal in one block; 1x reads need to start from address 48. 
+# 48..55 stays legally in 1 block; 1x reads according to documentation should start from address 48. 
 # ----------------------------------------------------
 
 binary_sensor:
@@ -578,7 +613,7 @@ climate:
       max_temperature: 40
 
 
-    # ✅ Mode mapping (van our select → climate mode)
+    # ✅ Mode mapping (from the climate-entity select → climate mode)
     mode: !lambda |-
       if (!id(hp_power).state) {
         return climate::CLIMATE_MODE_OFF;
@@ -591,7 +626,7 @@ climate:
 
       return climate::CLIMATE_MODE_HEAT;  // fallback
 
-    # ✅ Setpoint mapping (depending on of mode)
+    # ✅ Setpoint mapping (depending on mode)
     target_temperature: !lambda |-
       auto m = id(hp_function_mode).current_option();
 
@@ -600,13 +635,13 @@ climate:
 
       return id(hp_heating_setpoint).state;
 
-    # ✅ Available modes in Homeassistant
+    # ✅ available modes in Home Assistant
     supported_modes:
       - "OFF"
       - HEAT
       - COOL
 
-    # ✅ What needs to happen when a users adapts the setpoint/mode in the climate entity
+    # ✅ what should happen when user adapts mode in the UI.
     set_mode_action:
     - lambda: |-
         if (x == climate::CLIMATE_MODE_OFF) {
@@ -626,14 +661,14 @@ climate:
 
         call_mode.perform();
     
-    # ✅ we add delay
+    # ✅ add read-delay when writing so it doesn't conflict
     - delay: 250ms
 
-    # ✅ and then force a refresh
+    # ✅ force a refresh after the delay, so the UI-climate-entity reflects it.
     - component.update: aquaforte_holding
 
 
-    # ✅ what needs to occur when temperature is adapted in the climate-entity
+    # ✅ what should happen when the climate-temperature is adapted.
     set_target_temperature_action:
       - lambda: |-
           auto m = id(hp_function_mode).current_option();
@@ -655,10 +690,10 @@ climate:
           auto call = id(hp_heating_setpoint).make_call();
           call.set_value(x);
           call.perform();
-      # ✅ added delay to avoid that the set-value is not yet reflected in the controller
+      # ✅ add delay after write before reading it again, controller needs some time to register it.
       - delay: 250ms
 
-      # ✅ here after we refresh by a rs485 read
+      # ✅ after delay do a refresh
       - component.update: aquaforte_holding
 
     optimistic: false
