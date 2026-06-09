@@ -158,8 +158,8 @@ select:
     address: 1
     value_type: U_WORD
     optionsmap:
-      "Smart": 0
-      "Silence": 1
+      "Silence": 0
+      "Smart": 1
       "Turbo": 2
 
 number:
@@ -461,21 +461,6 @@ sensor:
       return roundf(id(hp_cop_filtered) * 100.0f) / 100.0f;
 
   
-  # Needed to have this sensor so it can be added to the energy-consumption tracking
-  - platform: total_daily_energy
-    name: "HP Daily Energy"
-    power_id: hp_input_power_kw
-    unit_of_measurement: "kWh"  
-  
-
-  - platform: integration
-    name: "HP Total Energy"
-    sensor: hp_input_power_kw
-    time_unit: h
-    unit_of_measurement: "kWh"
-    device_class: energy
-    state_class: total_increasing
-
 
 
 # -----------------------------
